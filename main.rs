@@ -418,12 +418,12 @@ impl Render for HexReversi {
             "Human"
         };
         let black_label = if compact {
-            format!("B: {black} ({black_role})")
+            format!("Black: {black}")
         } else {
             format!("Black: {black} ({black_role})")
         };
         let white_label = if compact {
-            format!("W: {white} ({white_role})")
+            format!("White: {white}")
         } else {
             format!("White: {white} ({white_role})")
         };
@@ -498,8 +498,35 @@ impl Render for HexReversi {
                             .when(!compact, |this| {
                                 this.child(div().text_sm().text_color(rgb(0x9ba8bf)).child("Score"))
                             })
-                            .child(div().text_xl().child(black_label))
-                            .child(div().text_xl().text_color(rgb(0xf6f2df)).child(white_label)),
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .when(compact, |this| this.flex().flex_col().gap_1())
+                                    .child(black_label)
+                                    .when(compact, |this| {
+                                        this.child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(0x9ba8bf))
+                                                .child(format!("({black_role})")),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .text_color(rgb(0xf6f2df))
+                                    .when(compact, |this| this.flex().flex_col().gap_1())
+                                    .child(white_label)
+                                    .when(compact, |this| {
+                                        this.child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(0x9ba8bf))
+                                                .child(format!("({white_role})")),
+                                        )
+                                    }),
+                            ),
                     )
                     .child(
                         div()
