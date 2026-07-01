@@ -7,16 +7,20 @@ use std::{
 };
 
 use gpui::{
-    App, Application, Bounds, Context, MouseDownEvent, PathBuilder, Pixels, Point, Render, Window,
-    WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb,
+    App, Application, Bounds, Context, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point,
+    Render, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb,
 };
 
 const RADIUS: i32 = 4;
 const HEX_SIZE: f32 = 34.0;
 const DIRECTIONS: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)];
 const FLIP_DURATION: Duration = Duration::from_millis(420);
-const COMPUTER_DELAY_MIN_MS: u64 = 550;
-const COMPUTER_DELAY_MAX_MS: u64 = 1_300;
+const COMPUTER_DELAY_MIN_MS: u64 = 1_100;
+const COMPUTER_DELAY_MAX_MS: u64 = 2_400;
+const COMPUTER_REPLY_DELAY_MIN_MS: u64 = 450;
+const COMPUTER_REPLY_DELAY_MAX_MS: u64 = 900;
+const SPEED_DELAY_MIN_MS: u64 = 80;
+const SPEED_DELAY_MAX_MS: u64 = 180;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Player {
@@ -50,6 +54,7 @@ struct CellGeometry {
 #[derive(Clone)]
 struct BoardGeometry {
     cells: Vec<CellGeometry>,
+    hex_size: f32,
 }
 
 #[derive(Clone)]
@@ -64,6 +69,13 @@ struct FlipCell {
 struct FlipAnimation {
     cells: Vec<FlipCell>,
     start: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct MoveScore {
+    q: i32,
+    r: i32,
+    score: i32,
 }
 
 #[derive(Clone)]
@@ -115,20 +127,23 @@ impl Game {
         true
     }
 
-    fn run_computer_turn(&mut self) {
-        while !self.game_over && self.current == self.computer {
-            let moves = self.legal_moves(self.current);
-            if moves.is_empty() {
-                self.advance_past_passes();
-                continue;
-            }
+    fn play_computer_move(&mut self) {
+        if self.game_over || self.current != self.computer {
+            return;
+        }
 
-            let (q, r) = moves[random_index(moves.len())];
-            let flips = self.flips_for_move(q, r, self.current);
-            self.apply_move(q, r, flips);
-            if !self.game_over {
-                self.message = Some("Computer played.".to_string());
-            }
+        let Some(choice) = self.choose_computer_move() else {
+            self.advance_past_passes();
+            return;
+        };
+        let flips = self.flips_for_move(choice.q, choice.r, self.current);
+        if flips.is_empty() {
+            return;
+        }
+
+        self.apply_move(choice.q, choice.r, flips);
+        if !self.game_over {
+            self.message = Some("Computer played.".to_string());
         }
     }
 
@@ -206,6 +221,49 @@ impl Game {
             .collect()
     }
 
+    fn scored_moves(&self, player: Player) -> Vec<MoveScore> {
+        let mut moves = self
+            .legal_moves(player)
+            .into_iter()
+            .map(|(q, r)| MoveScore {
+                q,
+                r,
+                score: self.move_score(q, r, player),
+            })
+            .collect::<Vec<_>>();
+        moves.sort_by_key(|move_score| -move_score.score);
+        moves
+    }
+
+    fn choose_computer_move(&self) -> Option<MoveScore> {
+        let moves = self.scored_moves(self.current);
+        let best_score = moves.first()?.score;
+        let best = moves
+            .iter()
+            .copied()
+            .filter(|move_score| move_score.score == best_score)
+            .collect::<Vec<_>>();
+        Some(best[random_index(best.len())])
+    }
+
+    fn move_score(&self, q: i32, r: i32, player: Player) -> i32 {
+        let flips = self.flips_for_move(q, r, player).len() as i32;
+        let s = -q - r;
+        let ring = q.abs().max(r.abs()).max(s.abs());
+        let is_corner = ring == RADIUS && (q == 0 || r == 0 || s == 0);
+        let is_edge = ring == RADIUS;
+
+        flips * 100
+            + if is_corner {
+                70
+            } else if is_edge {
+                30
+            } else {
+                0
+            }
+            - ring * 2
+    }
+
     fn score(&self) -> (usize, usize) {
         let black = self.board.values().filter(|&&p| p == Player::Black).count();
         let white = self.board.values().filter(|&&p| p == Player::White).count();
@@ -220,9 +278,23 @@ impl Game {
         let (black, white) = self.score();
         if self.game_over {
             return match black.cmp(&white) {
-                std::cmp::Ordering::Greater => format!("Game over: Black wins, {black}-{white}."),
-                std::cmp::Ordering::Less => format!("Game over: White wins, {black}-{white}."),
-                std::cmp::Ordering::Equal => format!("Game over: draw, {black}-{white}."),
+                std::cmp::Ordering::Greater => format!(
+                    "Black {black} > White {white}: {} won",
+                    if self.computer == Player::Black {
+                        "Computer"
+                    } else {
+                        "Human"
+                    }
+                ),
+                std::cmp::Ordering::Less => format!(
+                    "White {white} > Black {black}: {} won",
+                    if self.computer == Player::White {
+                        "Computer"
+                    } else {
+                        "Human"
+                    }
+                ),
+                std::cmp::Ordering::Equal => format!("Black {black} = White {white}: Draw"),
             };
         }
 
@@ -237,6 +309,8 @@ impl Game {
 struct HexReversi {
     game: Game,
     geometry: Rc<RefCell<Option<BoardGeometry>>>,
+    hover_cell: Option<(i32, i32)>,
+    speed_mode: bool,
     turn_serial: u64,
 }
 
@@ -245,48 +319,75 @@ impl HexReversi {
         Self {
             game: Game::new(),
             geometry: Rc::new(RefCell::new(None)),
+            hover_cell: None,
+            speed_mode: false,
             turn_serial: 0,
         }
     }
 
     fn reset(&mut self, cx: &mut Context<Self>) {
         self.game = Game::new();
+        self.hover_cell = None;
         self.turn_serial += 1;
-        self.schedule_computer_turn(cx);
+        self.schedule_computer_turn(cx, false);
         cx.notify();
     }
 
     fn click_board(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let Some(geometry) = self.geometry.borrow().clone() else {
-            return;
-        };
-
-        let hit_radius = HEX_SIZE * 0.92;
-        if let Some(cell) = geometry.cells.iter().find(|cell| {
-            let dx = f32::from(event.position.x - cell.center.x);
-            let dy = f32::from(event.position.y - cell.center.y);
-            (dx * dx + dy * dy).sqrt() <= hit_radius
-        }) {
-            if self.game.play_human(cell.q, cell.r) {
-                self.schedule_computer_turn(cx);
+        if let Some((q, r)) = self.cell_at_position(event.position) {
+            if self.game.play_human(q, r) {
+                self.hover_cell = None;
+                self.schedule_computer_turn(cx, true);
             }
             cx.notify();
         }
     }
 
-    fn schedule_computer_turn(&mut self, cx: &mut Context<Self>) {
+    fn hover_board(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let next_hover = self.cell_at_position(event.position).filter(|(q, r)| {
+            !self.game.game_over
+                && self.game.current != self.game.computer
+                && !self
+                    .game
+                    .flips_for_move(*q, *r, self.game.current)
+                    .is_empty()
+        });
+        if self.hover_cell != next_hover {
+            self.hover_cell = next_hover;
+            cx.notify();
+        }
+    }
+
+    fn cell_at_position(&self, position: Point<Pixels>) -> Option<(i32, i32)> {
+        let geometry = self.geometry.borrow().clone()?;
+        let hit_radius = geometry.hex_size * 0.92;
+        geometry
+            .cells
+            .iter()
+            .find(|cell| {
+                let dx = f32::from(position.x - cell.center.x);
+                let dy = f32::from(position.y - cell.center.y);
+                (dx * dx + dy * dy).sqrt() <= hit_radius
+            })
+            .map(|cell| (cell.q, cell.r))
+    }
+
+    fn schedule_computer_turn(&mut self, cx: &mut Context<Self>, after_human_move: bool) {
         if self.game.game_over || self.game.current != self.game.computer {
             return;
         }
 
         self.turn_serial += 1;
         let turn_serial = self.turn_serial;
-        let delay = random_computer_delay();
+        let delay = random_computer_delay(after_human_move, self.speed_mode);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             this.update(cx, |this, cx| {
                 if this.turn_serial == turn_serial {
-                    this.game.run_computer_turn();
+                    this.game.play_computer_move();
+                    if !this.game.game_over && this.game.current == this.game.computer {
+                        this.schedule_computer_turn(cx, true);
+                    }
                     cx.notify();
                 }
             })
@@ -294,10 +395,17 @@ impl HexReversi {
         })
         .detach();
     }
+
+    fn toggle_speed_mode(&mut self, cx: &mut Context<Self>) {
+        self.speed_mode = !self.speed_mode;
+        cx.notify();
+    }
 }
 
 impl Render for HexReversi {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let compact = f32::from(window.viewport_size().width) < 860.0;
+        let sidebar_width = if compact { px(176.0) } else { px(280.0) };
         let (black, white) = self.game.score();
         let black_role = if self.game.computer == Player::Black {
             "Computer"
@@ -309,10 +417,22 @@ impl Render for HexReversi {
         } else {
             "Human"
         };
+        let black_label = if compact {
+            format!("B: {black} ({black_role})")
+        } else {
+            format!("Black: {black} ({black_role})")
+        };
+        let white_label = if compact {
+            format!("W: {white} ({white_role})")
+        } else {
+            format!("White: {white} ({white_role})")
+        };
         let game_over = self.game.game_over;
+        let speed_mode = self.speed_mode;
         let right_status = self.game.status();
         let final_status = right_status.clone();
         let game = self.game.clone();
+        let hover_cell = self.hover_cell;
         let geometry = self.geometry.clone();
 
         div()
@@ -324,58 +444,145 @@ impl Render for HexReversi {
             .text_color(rgb(0xeef3ff))
             .child(
                 div()
-                    .w(px(280.0))
+                    .w(sidebar_width)
                     .h_full()
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap_4()
-                    .p_5()
+                    .when(compact, |this| this.gap_3().p_3())
+                    .when(!compact, |this| this.gap_5().p_5())
                     .rounded_xl()
                     .bg(rgb(0x1b2230))
                     .border_1()
                     .border_color(rgb(0x314058))
                     .child(
                         div()
-                            .text_2xl()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("Hexy Reversi"),
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .pb_4()
+                            .border_b_1()
+                            .border_color(rgb(0x314058))
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child("Hexy Reversi"),
+                            )
+                            .when(!compact, |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xffd166))
+                                        .child("build on top of gpui"),
+                                )
+                            })
+                            .when(!compact, |this| {
+                                this.child(
+                                    div()
+                                        .text_color(rgb(0x9ba8bf))
+                                        .child("Trap stones in any of the directions."),
+                                )
+                            }),
                     )
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(rgb(0xffd166))
-                            .child("made with gpui"),
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(0x202939))
+                            .border_1()
+                            .border_color(rgb(0x314058))
+                            .when(!compact, |this| {
+                                this.child(div().text_sm().text_color(rgb(0x9ba8bf)).child("Score"))
+                            })
+                            .child(div().text_xl().child(black_label))
+                            .child(div().text_xl().text_color(rgb(0xf6f2df)).child(white_label)),
                     )
                     .child(
                         div()
-                            .text_color(rgb(0x9ba8bf))
-                            .child("Trap stones in any of the 6 straight hex directions."),
-                    )
-                    .child(
-                        div()
-                            .text_xl()
-                            .child(format!("Black: {black} ({black_role})")),
-                    )
-                    .child(
-                        div()
-                            .text_xl()
-                            .text_color(rgb(0xf6f2df))
-                            .child(format!("White: {white} ({white_role})")),
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(0x314058))
+                            .when(!compact, |this| {
+                                this.child(
+                                    div().text_sm().text_color(rgb(0x9ba8bf)).child("Settings"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("speed-mode")
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .hover(|style| style.opacity(0.85))
+                                    .child("Speed mode")
+                                    .child(
+                                        div()
+                                            .w(px(54.0))
+                                            .h(px(30.0))
+                                            .p(px(3.0))
+                                            .rounded_full()
+                                            .flex()
+                                            .items_center()
+                                            .when(speed_mode, |this| {
+                                                this.justify_end().bg(rgb(0xffd166))
+                                            })
+                                            .when(!speed_mode, |this| {
+                                                this.justify_start().bg(rgb(0x314058))
+                                            })
+                                            .child(
+                                                div()
+                                                    .size(px(24.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(0xf6f2df)),
+                                            ),
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_speed_mode(cx)),
+                                    ),
+                            ),
                     )
                     .child(div().flex_1())
                     .child(
-                        div()
-                            .id("new-game")
-                            .p_3()
-                            .rounded_lg()
-                            .bg(rgb(0xffd166))
-                            .text_color(rgb(0x1d1607))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .cursor_pointer()
-                            .hover(|style| style.opacity(0.9))
-                            .child("New game")
-                            .on_click(cx.listener(|this, _, _, cx| this.reset(cx))),
+                        div().w_full().flex().justify_center().child(
+                            div()
+                                .id("new-game")
+                                .w(px(160.0))
+                                .h(px(64.0))
+                                .relative()
+                                .cursor_pointer()
+                                .hover(|style| style.opacity(0.9))
+                                .child(
+                                    canvas(
+                                        |_, _, _| {},
+                                        |bounds, _, window, _| paint_hex_button(bounds, window),
+                                    )
+                                    .size_full(),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .size_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(rgb(0x1d1607))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child("New game"),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.reset(cx))),
+                        ),
                     ),
             )
             .child(
@@ -416,7 +623,13 @@ impl Render for HexReversi {
                                         board_geometry
                                     },
                                     move |bounds, board_geometry, window, _| {
-                                        paint_board(bounds, &board_geometry, &game, window);
+                                        paint_board(
+                                            bounds,
+                                            &board_geometry,
+                                            &game,
+                                            hover_cell,
+                                            window,
+                                        );
                                     },
                                 )
                                 .size_full(),
@@ -452,7 +665,10 @@ impl Render for HexReversi {
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
                             this.click_board(event, cx)
                         }),
-                    ),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        this.hover_board(event, cx)
+                    })),
             )
     }
 }
@@ -465,9 +681,25 @@ fn random_player() -> Player {
     }
 }
 
-fn random_computer_delay() -> Duration {
-    let span = COMPUTER_DELAY_MAX_MS - COMPUTER_DELAY_MIN_MS + 1;
-    Duration::from_millis(COMPUTER_DELAY_MIN_MS + random_index(span as usize) as u64)
+fn guide_color_for_score(score: i32) -> u32 {
+    match score {
+        0..=129 => 0x93c5fd,
+        130..=229 => 0x5eead4,
+        230..=329 => 0xffd166,
+        _ => 0xfb7185,
+    }
+}
+
+fn random_computer_delay(after_human_move: bool, speed_mode: bool) -> Duration {
+    let (min, max) = if speed_mode {
+        (SPEED_DELAY_MIN_MS, SPEED_DELAY_MAX_MS)
+    } else if after_human_move {
+        (COMPUTER_REPLY_DELAY_MIN_MS, COMPUTER_REPLY_DELAY_MAX_MS)
+    } else {
+        (COMPUTER_DELAY_MIN_MS, COMPUTER_DELAY_MAX_MS)
+    };
+    let span = max - min + 1;
+    Duration::from_millis(min + random_index(span as usize) as u64)
 }
 
 fn random_index(len: usize) -> usize {
@@ -490,7 +722,10 @@ fn random_u64() -> u64 {
     // Mix the timestamp instead of using its low bit directly. Some platforms
     // report time in even nanosecond/microsecond steps, which made side choice
     // look stuck on one color.
-    let mut x = nanos ^ count.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    mix_u64(nanos ^ count.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+}
+
+fn mix_u64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;
@@ -516,8 +751,15 @@ fn cells() -> Vec<(i32, i32)> {
 }
 
 fn layout_board(bounds: Bounds<Pixels>) -> BoardGeometry {
-    let board_width = HEX_SIZE * 3.0_f32.sqrt() * ((RADIUS * 2 + 1) as f32);
-    let board_height = HEX_SIZE * 1.5 * ((RADIUS * 2 + 1) as f32);
+    let board_units = (RADIUS * 2 + 1) as f32;
+    let natural_width = HEX_SIZE * 3.0_f32.sqrt() * board_units;
+    let natural_height = HEX_SIZE * 1.5 * board_units;
+    let scale = (f32::from(bounds.size.width) / natural_width)
+        .min(f32::from(bounds.size.height) / natural_height)
+        .min(1.0);
+    let hex_size = (HEX_SIZE * scale).max(12.0);
+    let board_width = hex_size * 3.0_f32.sqrt() * board_units;
+    let board_height = hex_size * 1.5 * board_units;
     let origin = point(
         bounds.origin.x + (bounds.size.width - px(board_width)) / 2.0,
         bounds.origin.y + (bounds.size.height - px(board_height)) / 2.0,
@@ -526,8 +768,8 @@ fn layout_board(bounds: Bounds<Pixels>) -> BoardGeometry {
     let cells = cells()
         .into_iter()
         .map(|(q, r)| {
-            let x = HEX_SIZE * 3.0_f32.sqrt() * (q as f32 + r as f32 / 2.0);
-            let y = HEX_SIZE * 1.5 * r as f32;
+            let x = hex_size * 3.0_f32.sqrt() * (q as f32 + r as f32 / 2.0);
+            let y = hex_size * 1.5 * r as f32;
             CellGeometry {
                 q,
                 r,
@@ -539,18 +781,31 @@ fn layout_board(bounds: Bounds<Pixels>) -> BoardGeometry {
         })
         .collect();
 
-    BoardGeometry { cells }
+    BoardGeometry { cells, hex_size }
 }
 
-fn paint_board(bounds: Bounds<Pixels>, geometry: &BoardGeometry, game: &Game, window: &mut Window) {
+fn paint_board(
+    bounds: Bounds<Pixels>,
+    geometry: &BoardGeometry,
+    game: &Game,
+    hover_cell: Option<(i32, i32)>,
+    window: &mut Window,
+) {
     window.paint_quad(gpui::fill(bounds, rgb(0x202939)));
 
-    let legal: HashSet<(i32, i32)> = game.legal_moves(game.current).into_iter().collect();
+    let hex_size = geometry.hex_size;
+    let legal_moves = game.legal_moves(game.current);
+    let legal: HashSet<(i32, i32)> = legal_moves.iter().copied().collect();
+    let computer_thinking = !game.game_over && game.current == game.computer;
+    let scored_moves = computer_thinking.then(|| game.scored_moves(game.current));
+    let thinking_selection = computer_thinking
+        .then(|| thinking_move_selection(scored_moves.as_deref().unwrap_or(&[])))
+        .flatten();
     let active_flip = game.flip_animation.as_ref().and_then(|animation| {
         let progress = animation.start.elapsed().as_secs_f32() / FLIP_DURATION.as_secs_f32();
         (progress < 1.0).then_some((progress, animation))
     });
-    if active_flip.is_some() {
+    if active_flip.is_some() || computer_thinking {
         window.request_animation_frame();
     }
 
@@ -559,7 +814,7 @@ fn paint_board(bounds: Bounds<Pixels>, geometry: &BoardGeometry, game: &Game, wi
         paint_hex(
             window,
             cell.center,
-            HEX_SIZE,
+            hex_size,
             if alternate {
                 rgb(0x2a724f).into()
             } else {
@@ -567,13 +822,50 @@ fn paint_board(bounds: Bounds<Pixels>, geometry: &BoardGeometry, game: &Game, wi
             },
         );
 
-        if legal.contains(&(cell.q, cell.r)) && !game.game_over {
-            paint_circle(
+        let is_legal = legal.contains(&(cell.q, cell.r));
+        if hover_cell == Some((cell.q, cell.r)) && is_legal {
+            paint_hex_overlay(
                 window,
                 cell.center,
-                HEX_SIZE * 0.18,
-                Into::<gpui::Hsla>::into(rgb(0xffd166)).alpha(0.55),
+                hex_size - 4.0,
+                Into::<gpui::Hsla>::into(rgb(0xffd166)).alpha(0.24),
             );
+        }
+
+        if is_legal && !game.game_over {
+            let guide_color = Into::<gpui::Hsla>::into(rgb(0xffd166));
+            if let Some((_selected, color)) = thinking_selection
+                .filter(|(selected, _)| selected.0 == cell.q && selected.1 == cell.r)
+            {
+                let (inner_radius, inner_alpha, outer_radius, outer_alpha) =
+                    thinking_dot_pulse(hex_size);
+                paint_circle(
+                    window,
+                    cell.center,
+                    outer_radius * 1.15,
+                    color.alpha(outer_alpha),
+                );
+                paint_circle(
+                    window,
+                    cell.center,
+                    inner_radius * 1.35,
+                    color.alpha(inner_alpha),
+                );
+            } else if computer_thinking {
+                paint_circle(
+                    window,
+                    cell.center,
+                    hex_size * 0.12,
+                    guide_color.alpha(0.28),
+                );
+            } else {
+                paint_circle(
+                    window,
+                    cell.center,
+                    hex_size * 0.18,
+                    guide_color.alpha(0.55),
+                );
+            }
         }
 
         if let Some(player) = game.board.get(&(cell.q, cell.r)) {
@@ -583,13 +875,44 @@ fn paint_board(bounds: Bounds<Pixels>, geometry: &BoardGeometry, game: &Game, wi
                     .iter()
                     .find(|flip| flip.q == cell.q && flip.r == cell.r)
                 {
-                    paint_flip_piece(window, cell.center, progress, flip);
+                    paint_flip_piece(window, cell.center, progress, flip, hex_size);
                     continue;
                 }
             }
-            paint_circle(window, cell.center, HEX_SIZE * 0.48, player_color(*player));
+            paint_circle(window, cell.center, hex_size * 0.48, player_color(*player));
         }
     }
+}
+
+fn thinking_move_selection(scored_moves: &[MoveScore]) -> Option<((i32, i32), gpui::Hsla)> {
+    if scored_moves.is_empty() {
+        return None;
+    }
+
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as usize / 180)
+        .unwrap_or(0);
+    let candidate_count = scored_moves.len().min(4);
+    let selected = scored_moves[tick % candidate_count];
+    let color = rgb(guide_color_for_score(selected.score)).into();
+
+    Some(((selected.q, selected.r), color))
+}
+
+fn thinking_dot_pulse(hex_size: f32) -> (f32, f32, f32, f32) {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as f32)
+        .unwrap_or(0.0);
+    let wave = ((millis / 900.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+
+    let inner_radius = hex_size * (0.18 + wave * 0.12);
+    let outer_radius = hex_size * (0.36 + wave * 0.24);
+    let inner_alpha = 0.55 + wave * 0.45;
+    let outer_alpha = 0.38 * (1.0 - wave);
+
+    (inner_radius, inner_alpha, outer_radius, outer_alpha)
 }
 
 fn player_color(player: Player) -> gpui::Hsla {
@@ -599,7 +922,13 @@ fn player_color(player: Player) -> gpui::Hsla {
     }
 }
 
-fn paint_flip_piece(window: &mut Window, center: Point<Pixels>, progress: f32, flip: &FlipCell) {
+fn paint_flip_piece(
+    window: &mut Window,
+    center: Point<Pixels>,
+    progress: f32,
+    flip: &FlipCell,
+    hex_size: f32,
+) {
     let progress = progress.clamp(0.0, 1.0);
     let (player, width_factor) = if progress < 0.5 {
         (flip.from, 1.0 - progress * 2.0)
@@ -611,10 +940,41 @@ fn paint_flip_piece(window: &mut Window, center: Point<Pixels>, progress: f32, f
     paint_ellipse(
         window,
         center,
-        HEX_SIZE * 0.48 * width_factor,
-        HEX_SIZE * 0.48,
+        hex_size * 0.48 * width_factor,
+        hex_size * 0.48,
         player_color(player),
     );
+}
+
+fn paint_hex_overlay(window: &mut Window, center: Point<Pixels>, radius: f32, color: gpui::Hsla) {
+    let mut fill = PathBuilder::fill();
+    add_hex_path(&mut fill, center, radius);
+    if let Ok(path) = fill.build() {
+        window.paint_path(path, color);
+    }
+}
+
+fn paint_hex_button(bounds: Bounds<Pixels>, window: &mut Window) {
+    let center = bounds.center();
+    let radius_x = f32::from(bounds.size.width) / 2.0;
+    let radius_y = f32::from(bounds.size.height) / 2.0;
+
+    let mut shadow = PathBuilder::fill();
+    add_scaled_hex_path(
+        &mut shadow,
+        point(center.x, center.y + px(2.0)),
+        radius_x,
+        radius_y,
+    );
+    if let Ok(path) = shadow.build() {
+        window.paint_path(path, Into::<gpui::Hsla>::into(rgb(0x000000)).alpha(0.18));
+    }
+
+    let mut fill = PathBuilder::fill();
+    add_scaled_hex_path(&mut fill, center, radius_x - 2.0, radius_y - 2.0);
+    if let Ok(path) = fill.build() {
+        window.paint_path(path, rgb(0xffd166));
+    }
 }
 
 fn paint_hex(window: &mut Window, center: Point<Pixels>, radius: f32, color: gpui::Hsla) {
@@ -632,11 +992,20 @@ fn paint_hex(window: &mut Window, center: Point<Pixels>, radius: f32, color: gpu
 }
 
 fn add_hex_path(builder: &mut PathBuilder, center: Point<Pixels>, radius: f32) {
+    add_scaled_hex_path(builder, center, radius, radius);
+}
+
+fn add_scaled_hex_path(
+    builder: &mut PathBuilder,
+    center: Point<Pixels>,
+    radius_x: f32,
+    radius_y: f32,
+) {
     for i in 0..6 {
         let angle = (30.0 + i as f32 * 60.0).to_radians();
         let p = point(
-            center.x + px(radius * angle.cos()),
-            center.y + px(radius * angle.sin()),
+            center.x + px(radius_x * angle.cos()),
+            center.y + px(radius_y * angle.sin()),
         );
         if i == 0 {
             builder.move_to(p);
@@ -688,18 +1057,21 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(gpui::size(px(680.0), px(500.0))),
                 focus: true,
                 ..Default::default()
             },
-            |_, cx| {
+            |window, cx| {
+                window.set_window_title("Hexy Reversi");
                 cx.new(|cx| {
                     let mut app = HexReversi::new();
-                    app.schedule_computer_turn(cx);
+                    app.schedule_computer_turn(cx, false);
                     app
                 })
             },
         )
         .unwrap();
+        cx.on_window_closed(|cx| cx.quit()).detach();
         cx.activate(true);
     });
 }
