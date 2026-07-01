@@ -15,7 +15,8 @@ const RADIUS: i32 = 4;
 const HEX_SIZE: f32 = 34.0;
 const DIRECTIONS: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)];
 const FLIP_DURATION: Duration = Duration::from_millis(420);
-const COMPUTER_DELAY: Duration = Duration::from_millis(650);
+const COMPUTER_DELAY_MIN_MS: u64 = 550;
+const COMPUTER_DELAY_MAX_MS: u64 = 1_300;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Player {
@@ -84,16 +85,14 @@ impl Game {
         board.insert((1, 0), Player::White);
 
         let computer = random_player();
-        let mut game = Self {
+        Self {
             board,
             current: Player::Black,
             computer,
             game_over: false,
             message: None,
             flip_animation: None,
-        };
-        game.run_computer_turn();
-        game
+        }
     }
 
     fn play_human(&mut self, q: i32, r: i32) -> bool {
@@ -227,7 +226,11 @@ impl Game {
             };
         }
 
-        format!("{} to move", self.current.name())
+        if self.current == self.computer {
+            "Computer is thinking.".to_string()
+        } else {
+            format!("{} to move", self.current.name())
+        }
     }
 }
 
@@ -249,6 +252,7 @@ impl HexReversi {
     fn reset(&mut self, cx: &mut Context<Self>) {
         self.game = Game::new();
         self.turn_serial += 1;
+        self.schedule_computer_turn(cx);
         cx.notify();
     }
 
@@ -271,10 +275,15 @@ impl HexReversi {
     }
 
     fn schedule_computer_turn(&mut self, cx: &mut Context<Self>) {
+        if self.game.game_over || self.game.current != self.game.computer {
+            return;
+        }
+
         self.turn_serial += 1;
         let turn_serial = self.turn_serial;
+        let delay = random_computer_delay();
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(COMPUTER_DELAY).await;
+            cx.background_executor().timer(delay).await;
             this.update(cx, |this, cx| {
                 if this.turn_serial == turn_serial {
                     this.game.run_computer_turn();
@@ -454,6 +463,11 @@ fn random_player() -> Player {
     } else {
         Player::White
     }
+}
+
+fn random_computer_delay() -> Duration {
+    let span = COMPUTER_DELAY_MAX_MS - COMPUTER_DELAY_MIN_MS + 1;
+    Duration::from_millis(COMPUTER_DELAY_MIN_MS + random_index(span as usize) as u64)
 }
 
 fn random_index(len: usize) -> usize {
@@ -677,7 +691,13 @@ fn main() {
                 focus: true,
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| HexReversi::new()),
+            |_, cx| {
+                cx.new(|cx| {
+                    let mut app = HexReversi::new();
+                    app.schedule_computer_turn(cx);
+                    app
+                })
+            },
         )
         .unwrap();
         cx.activate(true);
