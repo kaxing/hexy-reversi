@@ -10,6 +10,7 @@ use gpui::{
     App, Application, Bounds, Context, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point,
     Render, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb,
 };
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Source, source::SineWave};
 
 const RADIUS: i32 = 4;
 const HEX_SIZE: f32 = 34.0;
@@ -21,6 +22,70 @@ const COMPUTER_REPLY_DELAY_MIN_MS: u64 = 450;
 const COMPUTER_REPLY_DELAY_MAX_MS: u64 = 900;
 const SPEED_DELAY_MIN_MS: u64 = 80;
 const SPEED_DELAY_MAX_MS: u64 = 180;
+
+struct Audio {
+    sink: Option<MixerDeviceSink>,
+}
+
+impl Audio {
+    fn new() -> Self {
+        let sink = DeviceSinkBuilder::open_default_sink()
+            .map(|mut sink| {
+                sink.log_on_drop(false);
+                sink
+            })
+            .ok();
+
+        Self { sink }
+    }
+
+    fn move_sound(&self) {
+        self.play_tone(520.0, 46, 0.18, 0);
+        self.play_tone(780.0, 54, 0.12, 28);
+    }
+
+    fn computer_sound(&self) {
+        self.play_tone(360.0, 42, 0.14, 0);
+        self.play_tone(540.0, 48, 0.14, 34);
+    }
+
+    fn invalid_sound(&self) {
+        self.play_tone(150.0, 90, 0.16, 0);
+    }
+
+    fn hover_sound(&self) {
+        self.play_tone(620.0, 32, 0.09, 0);
+    }
+
+    fn selection_sound(&self) {
+        self.play_tone(700.0, 24, 0.07, 0);
+    }
+
+    fn game_over_sound(&self) {
+        self.play_tone(440.0, 90, 0.15, 0);
+        self.play_tone(660.0, 110, 0.15, 95);
+        self.play_tone(880.0, 140, 0.13, 205);
+    }
+
+    fn new_game_sound(&self) {
+        self.play_tone(660.0, 55, 0.13, 0);
+        self.play_tone(990.0, 75, 0.11, 45);
+    }
+
+    fn play_tone(&self, frequency: f32, duration_ms: u64, volume: f32, delay_ms: u64) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+
+        let tone = SineWave::new(frequency)
+            .take_duration(Duration::from_millis(duration_ms))
+            .fade_in(Duration::from_millis(5))
+            .fade_out(Duration::from_millis(18))
+            .amplify(volume)
+            .delay(Duration::from_millis(delay_ms));
+        sink.mixer().add(tone);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Player {
@@ -127,24 +192,25 @@ impl Game {
         true
     }
 
-    fn play_computer_move(&mut self) {
+    fn play_computer_move(&mut self) -> bool {
         if self.game_over || self.current != self.computer {
-            return;
+            return false;
         }
 
         let Some(choice) = self.choose_computer_move() else {
             self.advance_past_passes();
-            return;
+            return false;
         };
         let flips = self.flips_for_move(choice.q, choice.r, self.current);
         if flips.is_empty() {
-            return;
+            return false;
         }
 
         self.apply_move(choice.q, choice.r, flips);
         if !self.game_over {
             self.message = Some("Computer played.".to_string());
         }
+        true
     }
 
     fn apply_move(&mut self, q: i32, r: i32, flips: Vec<(i32, i32)>) {
@@ -311,6 +377,8 @@ struct HexReversi {
     geometry: Rc<RefCell<Option<BoardGeometry>>>,
     hover_cell: Option<(i32, i32)>,
     speed_mode: bool,
+    sound_enabled: bool,
+    audio: Audio,
     turn_serial: u64,
 }
 
@@ -321,6 +389,8 @@ impl HexReversi {
             geometry: Rc::new(RefCell::new(None)),
             hover_cell: None,
             speed_mode: false,
+            sound_enabled: true,
+            audio: Audio::new(),
             turn_serial: 0,
         }
     }
@@ -329,15 +399,30 @@ impl HexReversi {
         self.game = Game::new();
         self.hover_cell = None;
         self.turn_serial += 1;
+        if self.sound_enabled {
+            self.audio.new_game_sound();
+        }
         self.schedule_computer_turn(cx, false);
         cx.notify();
     }
 
     fn click_board(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         if let Some((q, r)) = self.cell_at_position(event.position) {
+            let human_turn = !self.game.game_over && self.game.current != self.game.computer;
+            let legal = human_turn && !self.game.flips_for_move(q, r, self.game.current).is_empty();
+            let was_game_over = self.game.game_over;
+
             if self.game.play_human(q, r) {
+                if self.sound_enabled {
+                    self.audio.move_sound();
+                }
                 self.hover_cell = None;
+                if self.sound_enabled && !was_game_over && self.game.game_over {
+                    self.audio.game_over_sound();
+                }
                 self.schedule_computer_turn(cx, true);
+            } else if self.sound_enabled && human_turn && !legal {
+                self.audio.invalid_sound();
             }
             cx.notify();
         }
@@ -353,6 +438,9 @@ impl HexReversi {
                     .is_empty()
         });
         if self.hover_cell != next_hover {
+            if self.sound_enabled && next_hover.is_some() {
+                self.audio.hover_sound();
+            }
             self.hover_cell = next_hover;
             cx.notify();
         }
@@ -381,10 +469,35 @@ impl HexReversi {
         let turn_serial = self.turn_serial;
         let delay = random_computer_delay(after_human_move, self.speed_mode);
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(delay).await;
+            let mut elapsed = Duration::ZERO;
+            while elapsed < delay {
+                let step = (delay - elapsed).min(Duration::from_millis(180));
+                cx.background_executor().timer(step).await;
+                elapsed += step;
+                this.update(cx, |this, _| {
+                    if this.turn_serial == turn_serial
+                        && !this.game.game_over
+                        && this.game.current == this.game.computer
+                    {
+                        if this.sound_enabled {
+                            this.audio.selection_sound();
+                        }
+                    }
+                })
+                .ok();
+            }
+
             this.update(cx, |this, cx| {
                 if this.turn_serial == turn_serial {
-                    this.game.play_computer_move();
+                    let was_game_over = this.game.game_over;
+                    if this.game.play_computer_move() {
+                        if this.sound_enabled {
+                            this.audio.computer_sound();
+                        }
+                        if this.sound_enabled && !was_game_over && this.game.game_over {
+                            this.audio.game_over_sound();
+                        }
+                    }
                     if !this.game.game_over && this.game.current == this.game.computer {
                         this.schedule_computer_turn(cx, true);
                     }
@@ -398,6 +511,11 @@ impl HexReversi {
 
     fn toggle_speed_mode(&mut self, cx: &mut Context<Self>) {
         self.speed_mode = !self.speed_mode;
+        cx.notify();
+    }
+
+    fn toggle_sound(&mut self, cx: &mut Context<Self>) {
+        self.sound_enabled = !self.sound_enabled;
         cx.notify();
     }
 }
@@ -429,6 +547,7 @@ impl Render for HexReversi {
         };
         let game_over = self.game.game_over;
         let speed_mode = self.speed_mode;
+        let sound_enabled = self.sound_enabled;
         let right_status = self.game.status();
         let final_status = right_status.clone();
         let game = self.game.clone();
@@ -576,6 +695,39 @@ impl Render for HexReversi {
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.toggle_speed_mode(cx)),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .id("sound")
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .hover(|style| style.opacity(0.85))
+                                    .child("Sound effects")
+                                    .child(
+                                        div()
+                                            .w(px(54.0))
+                                            .h(px(30.0))
+                                            .p(px(3.0))
+                                            .rounded_full()
+                                            .flex()
+                                            .items_center()
+                                            .when(sound_enabled, |this| {
+                                                this.justify_end().bg(rgb(0xffd166))
+                                            })
+                                            .when(!sound_enabled, |this| {
+                                                this.justify_start().bg(rgb(0x314058))
+                                            })
+                                            .child(
+                                                div()
+                                                    .size(px(24.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(0xf6f2df)),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sound(cx))),
                             ),
                     )
                     .child(div().flex_1())
