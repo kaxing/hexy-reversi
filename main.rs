@@ -7,8 +7,9 @@ use std::{
 };
 
 use gpui::{
-    App, Application, Bounds, Context, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point,
-    Render, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb,
+    Animation, AnimationExt as _, App, Application, Bounds, Context, MouseDownEvent,
+    MouseMoveEvent, PathBuilder, Pixels, Point, Render, Window, WindowBounds, WindowOptions,
+    canvas, div, point, prelude::*, px, rgb,
 };
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Source, source::SineWave};
 
@@ -22,6 +23,15 @@ const COMPUTER_REPLY_DELAY_MIN_MS: u64 = 450;
 const COMPUTER_REPLY_DELAY_MAX_MS: u64 = 900;
 const SPEED_DELAY_MIN_MS: u64 = 80;
 const SPEED_DELAY_MAX_MS: u64 = 180;
+const LOGIC_DRAWER_WIDTH: f32 = 360.0;
+const LOGIC_VISUAL_HEIGHT: f32 = 520.0;
+const LOGIC_FLOW_X: f32 = 0.0;
+const LOGIC_FLOW_Y: f32 = 0.0;
+const LOGIC_FLOW_W: f32 = 328.0;
+const LOGIC_FLOW_H: f32 = 178.0;
+const LOGIC_ROW_START: f32 = 210.0;
+const LOGIC_ROW_H: f32 = 32.0;
+const LOGIC_ROW_GAP: f32 = 5.0;
 
 struct Audio {
     sink: Option<MixerDeviceSink>,
@@ -143,6 +153,58 @@ struct MoveScore {
     score: i32,
 }
 
+#[derive(Clone, Copy)]
+struct MoveBreakdown {
+    q: i32,
+    r: i32,
+    flips: i32,
+    position_bonus: i32,
+    ring_penalty: i32,
+    score: i32,
+}
+
+#[derive(Clone)]
+struct LogicStage {
+    label: &'static str,
+    value: String,
+    color: u32,
+}
+
+#[derive(Clone)]
+struct LogicInstruction {
+    op: &'static str,
+    arg: String,
+    note: String,
+    color: u32,
+    stage: usize,
+}
+
+#[derive(Clone)]
+struct LogicScoreNode {
+    label: String,
+    value: String,
+}
+
+#[derive(Clone)]
+struct LogicVisual {
+    stages: Vec<LogicStage>,
+    instructions: Vec<LogicInstruction>,
+    score_nodes: Vec<LogicScoreNode>,
+    live_animation: Option<(u64, Duration)>,
+}
+
+#[derive(Clone, Copy)]
+struct LogicPathSegment {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+struct LogicPath {
+    segments: Vec<LogicPathSegment>,
+}
+
 #[derive(Clone)]
 struct Game {
     board: HashMap<(i32, i32), Player>,
@@ -192,25 +254,25 @@ impl Game {
         true
     }
 
-    fn play_computer_move(&mut self) -> bool {
+    fn play_computer_move(&mut self) -> Option<MoveScore> {
         if self.game_over || self.current != self.computer {
-            return false;
+            return None;
         }
 
         let Some(choice) = self.choose_computer_move() else {
             self.advance_past_passes();
-            return false;
+            return None;
         };
         let flips = self.flips_for_move(choice.q, choice.r, self.current);
         if flips.is_empty() {
-            return false;
+            return None;
         }
 
         self.apply_move(choice.q, choice.r, flips);
         if !self.game_over {
             self.message = Some("Computer played.".to_string());
         }
-        true
+        Some(choice)
     }
 
     fn apply_move(&mut self, q: i32, r: i32, flips: Vec<(i32, i32)>) {
@@ -288,14 +350,21 @@ impl Game {
     }
 
     fn scored_moves(&self, player: Player) -> Vec<MoveScore> {
+        self.scored_move_breakdowns(player)
+            .into_iter()
+            .map(|breakdown| MoveScore {
+                q: breakdown.q,
+                r: breakdown.r,
+                score: breakdown.score,
+            })
+            .collect()
+    }
+
+    fn scored_move_breakdowns(&self, player: Player) -> Vec<MoveBreakdown> {
         let mut moves = self
             .legal_moves(player)
             .into_iter()
-            .map(|(q, r)| MoveScore {
-                q,
-                r,
-                score: self.move_score(q, r, player),
-            })
+            .map(|(q, r)| self.move_breakdown(q, r, player))
             .collect::<Vec<_>>();
         moves.sort_by_key(|move_score| -move_score.score);
         moves
@@ -312,22 +381,29 @@ impl Game {
         Some(best[random_index(best.len())])
     }
 
-    fn move_score(&self, q: i32, r: i32, player: Player) -> i32 {
+    fn move_breakdown(&self, q: i32, r: i32, player: Player) -> MoveBreakdown {
         let flips = self.flips_for_move(q, r, player).len() as i32;
         let s = -q - r;
         let ring = q.abs().max(r.abs()).max(s.abs());
         let is_corner = ring == RADIUS && (q == 0 || r == 0 || s == 0);
         let is_edge = ring == RADIUS;
+        let position_bonus = if is_corner {
+            70
+        } else if is_edge {
+            30
+        } else {
+            0
+        };
+        let ring_penalty = ring * 2;
 
-        flips * 100
-            + if is_corner {
-                70
-            } else if is_edge {
-                30
-            } else {
-                0
-            }
-            - ring * 2
+        MoveBreakdown {
+            q,
+            r,
+            flips,
+            position_bonus,
+            ring_penalty,
+            score: flips * 100 + position_bonus - ring_penalty,
+        }
     }
 
     fn score(&self) -> (usize, usize) {
@@ -378,8 +454,12 @@ struct HexReversi {
     hover_cell: Option<(i32, i32)>,
     speed_mode: bool,
     sound_enabled: bool,
+    computer_verbose: bool,
     audio: Audio,
+    logic_events: Vec<String>,
     turn_serial: u64,
+    computer_thinking_started: Option<Instant>,
+    computer_thinking_delay: Duration,
 }
 
 impl HexReversi {
@@ -390,14 +470,21 @@ impl HexReversi {
             hover_cell: None,
             speed_mode: false,
             sound_enabled: true,
+            computer_verbose: true,
             audio: Audio::new(),
+            logic_events: vec!["Ready: Black moves first.".to_string()],
             turn_serial: 0,
+            computer_thinking_started: None,
+            computer_thinking_delay: Duration::from_millis(1),
         }
     }
 
     fn reset(&mut self, cx: &mut Context<Self>) {
         self.game = Game::new();
         self.hover_cell = None;
+        self.logic_events.clear();
+        self.log_logic("New game: board reset.");
+        self.computer_thinking_started = None;
         self.turn_serial += 1;
         if self.sound_enabled {
             self.audio.new_game_sound();
@@ -409,20 +496,32 @@ impl HexReversi {
     fn click_board(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         if let Some((q, r)) = self.cell_at_position(event.position) {
             let human_turn = !self.game.game_over && self.game.current != self.game.computer;
-            let legal = human_turn && !self.game.flips_for_move(q, r, self.game.current).is_empty();
+            let flips = if human_turn {
+                self.game.flips_for_move(q, r, self.game.current)
+            } else {
+                Vec::new()
+            };
+            let legal = !flips.is_empty();
             let was_game_over = self.game.game_over;
 
             if self.game.play_human(q, r) {
+                self.log_logic(format!("Human: ({q},{r}) flips {} stones.", flips.len()));
                 if self.sound_enabled {
                     self.audio.move_sound();
                 }
                 self.hover_cell = None;
+                if !was_game_over && self.game.game_over {
+                    self.log_logic(format!("Result: {}", self.game.status()));
+                }
                 if self.sound_enabled && !was_game_over && self.game.game_over {
                     self.audio.game_over_sound();
                 }
                 self.schedule_computer_turn(cx, true);
-            } else if self.sound_enabled && human_turn && !legal {
-                self.audio.invalid_sound();
+            } else if human_turn && !legal {
+                self.log_logic(format!("Rule: ({q},{r}) traps no stones."));
+                if self.sound_enabled {
+                    self.audio.invalid_sound();
+                }
             }
             cx.notify();
         }
@@ -466,8 +565,15 @@ impl HexReversi {
         }
 
         self.turn_serial += 1;
+        self.log_logic(format!(
+            "AI: evaluating {} legal moves.",
+            self.game.legal_moves(self.game.current).len()
+        ));
+        self.log_logic(format!("AI: top scores {}", self.top_move_summary()));
         let turn_serial = self.turn_serial;
         let delay = random_computer_delay(after_human_move, self.speed_mode);
+        self.computer_thinking_started = Some(Instant::now());
+        self.computer_thinking_delay = delay;
         cx.spawn(async move |this, cx| {
             let mut elapsed = Duration::ZERO;
             while elapsed < delay {
@@ -489,10 +595,18 @@ impl HexReversi {
 
             this.update(cx, |this, cx| {
                 if this.turn_serial == turn_serial {
+                    this.computer_thinking_started = None;
                     let was_game_over = this.game.game_over;
-                    if this.game.play_computer_move() {
+                    if let Some(choice) = this.game.play_computer_move() {
+                        this.log_logic(format!(
+                            "AI: ({},{}) score {} selected.",
+                            choice.q, choice.r, choice.score
+                        ));
                         if this.sound_enabled {
                             this.audio.computer_sound();
+                        }
+                        if !was_game_over && this.game.game_over {
+                            this.log_logic(format!("Result: {}", this.game.status()));
                         }
                         if this.sound_enabled && !was_game_over && this.game.game_over {
                             this.audio.game_over_sound();
@@ -517,6 +631,32 @@ impl HexReversi {
     fn toggle_sound(&mut self, cx: &mut Context<Self>) {
         self.sound_enabled = !self.sound_enabled;
         cx.notify();
+    }
+
+    fn toggle_computer_verbose(&mut self, cx: &mut Context<Self>) {
+        self.computer_verbose = !self.computer_verbose;
+        cx.notify();
+    }
+
+    fn log_logic(&mut self, event: impl Into<String>) {
+        self.logic_events.push(event.into());
+        if self.logic_events.len() > 12 {
+            self.logic_events.remove(0);
+        }
+    }
+
+    fn top_move_summary(&self) -> String {
+        let moves = self.game.scored_moves(self.game.current);
+        if moves.is_empty() {
+            return "none".to_string();
+        }
+
+        moves
+            .iter()
+            .take(4)
+            .map(|move_score| format!("({},{})={}", move_score.q, move_score.r, move_score.score))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -548,8 +688,23 @@ impl Render for HexReversi {
         let game_over = self.game.game_over;
         let speed_mode = self.speed_mode;
         let sound_enabled = self.sound_enabled;
+        let computer_verbose = self.computer_verbose;
         let right_status = self.game.status();
         let final_status = right_status.clone();
+        let candidate_breakdowns = self.game.scored_move_breakdowns(self.game.current);
+        let empty_cells = cells().len().saturating_sub(self.game.board.len());
+        let computer_selection = (!self.game.game_over
+            && self.game.current == self.game.computer
+            && self.computer_thinking_started.is_some())
+        .then_some((self.turn_serial, self.computer_thinking_delay));
+        let logic_visual = build_logic_visual(
+            &self.game,
+            &candidate_breakdowns,
+            black,
+            white,
+            empty_cells,
+            computer_selection,
+        );
         let game = self.game.clone();
         let hover_cell = self.hover_cell;
         let geometry = self.geometry.clone();
@@ -728,6 +883,41 @@ impl Render for HexReversi {
                                             ),
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_sound(cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("computer-verbose")
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .hover(|style| style.opacity(0.85))
+                                    .child("Computer Verbose")
+                                    .child(
+                                        div()
+                                            .w(px(54.0))
+                                            .h(px(30.0))
+                                            .p(px(3.0))
+                                            .rounded_full()
+                                            .flex()
+                                            .items_center()
+                                            .when(computer_verbose, |this| {
+                                                this.justify_end().bg(rgb(0xffd166))
+                                            })
+                                            .when(!computer_verbose, |this| {
+                                                this.justify_start().bg(rgb(0x314058))
+                                            })
+                                            .child(
+                                                div()
+                                                    .size(px(24.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(0xf6f2df)),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_computer_verbose(cx)
+                                    })),
                             ),
                     )
                     .child(div().flex_1())
@@ -849,7 +1039,543 @@ impl Render for HexReversi {
                         this.hover_board(event, cx)
                     })),
             )
+            .when(computer_verbose, |this| {
+                this.child(
+                    div()
+                        .w(px(LOGIC_DRAWER_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_xl()
+                        .bg(rgb(0x1b2230))
+                        .border_1()
+                        .border_color(rgb(0x314058))
+                        .child(render_logic_visual(logic_visual)),
+                )
+            })
     }
+}
+
+fn build_logic_visual(
+    game: &Game,
+    candidates: &[MoveBreakdown],
+    black: usize,
+    white: usize,
+    empty: usize,
+    live_animation: Option<(u64, Duration)>,
+) -> LogicVisual {
+    let top_score = candidates
+        .first()
+        .map(|candidate| candidate.score.to_string())
+        .unwrap_or_else(|| "pass".to_string());
+    let selected = candidates
+        .first()
+        .map(|candidate| format!("{},{}", candidate.q, candidate.r))
+        .unwrap_or_else(|| "pass".to_string());
+    let actor = if game.current == game.computer {
+        "AI"
+    } else {
+        "human"
+    };
+    let status = if game.game_over {
+        "done".to_string()
+    } else {
+        format!(
+            "{} {}",
+            if actor == "AI" { "AI" } else { "H" },
+            match game.current {
+                Player::Black => "B",
+                Player::White => "W",
+            }
+        )
+    };
+
+    let stages = vec![
+        LogicStage {
+            label: "board",
+            value: format!("{black}/{white}"),
+            color: 0x93c5fd,
+        },
+        LogicStage {
+            label: "turn",
+            value: status,
+            color: 0x5eead4,
+        },
+        LogicStage {
+            label: "legal",
+            value: candidates.len().to_string(),
+            color: 0xffd166,
+        },
+        LogicStage {
+            label: "score",
+            value: top_score,
+            color: 0xffd166,
+        },
+        LogicStage {
+            label: "pick",
+            value: selected,
+            color: 0xfb7185,
+        },
+        LogicStage {
+            label: "state",
+            value: format!("{empty} open"),
+            color: 0xc084fc,
+        },
+    ];
+
+    let mut instructions = vec![
+        LogicInstruction {
+            op: "LOAD",
+            arg: "BOARD".to_string(),
+            note: format!("B{black} W{white}"),
+            color: 0x93c5fd,
+            stage: 0,
+        },
+        LogicInstruction {
+            op: "READ",
+            arg: "TURN".to_string(),
+            note: format!("{} {}", actor, game.current.name()),
+            color: 0x5eead4,
+            stage: 1,
+        },
+        LogicInstruction {
+            op: "SCAN",
+            arg: "LEGAL".to_string(),
+            note: format!("{} moves", candidates.len()),
+            color: 0xffd166,
+            stage: 2,
+        },
+    ];
+
+    for candidate in candidates.iter().take(3) {
+        instructions.push(LogicInstruction {
+            op: "SCORE",
+            arg: format!("({},{})", candidate.q, candidate.r),
+            note: format!(
+                "+{} +{} -{} = {}",
+                candidate.flips * 100,
+                candidate.position_bonus,
+                candidate.ring_penalty,
+                candidate.score
+            ),
+            color: 0xffd166,
+            stage: 3,
+        });
+    }
+    if candidates.is_empty() {
+        instructions.push(LogicInstruction {
+            op: "SCORE",
+            arg: "none".to_string(),
+            note: "pass".to_string(),
+            color: 0xffd166,
+            stage: 3,
+        });
+    }
+
+    instructions.push(LogicInstruction {
+        op: "PICK",
+        arg: stages[4].value.clone(),
+        note: if candidates.is_empty() {
+            "pass turn".to_string()
+        } else {
+            "best score".to_string()
+        },
+        color: 0xfb7185,
+        stage: 4,
+    });
+    instructions.push(LogicInstruction {
+        op: if game.game_over { "DONE" } else { "WAIT" },
+        arg: "STATE".to_string(),
+        note: stages[5].value.clone(),
+        color: 0xc084fc,
+        stage: 5,
+    });
+
+    let mut score_nodes = candidates
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(index, candidate)| LogicScoreNode {
+            label: char::from(b'A' + index as u8).to_string(),
+            value: format!("{},{}={}", candidate.q, candidate.r, candidate.score),
+        })
+        .collect::<Vec<_>>();
+    if score_nodes.is_empty() {
+        score_nodes.push(LogicScoreNode {
+            label: "—".to_string(),
+            value: "pass".to_string(),
+        });
+    }
+
+    LogicVisual {
+        stages,
+        instructions,
+        score_nodes,
+        live_animation,
+    }
+}
+
+fn render_logic_visual(visual: LogicVisual) -> gpui::AnyElement {
+    let base = div()
+        .relative()
+        .w_full()
+        .h(px(LOGIC_VISUAL_HEIGHT))
+        .rounded_lg()
+        .bg(rgb(0x101827))
+        .border_1()
+        .border_color(rgb(0x26364d))
+        .overflow_hidden();
+
+    if let Some((serial, duration)) = visual.live_animation {
+        base.with_animation(
+            ("logic-computer-selection", serial),
+            Animation::new(duration),
+            move |panel, progress| render_logic_scene(panel, progress, visual.clone()),
+        )
+        .into_any_element()
+    } else {
+        render_logic_scene(base, 1.0, visual).into_any_element()
+    }
+}
+
+fn render_logic_scene(mut panel: gpui::Div, progress: f32, visual: LogicVisual) -> gpui::Div {
+    let instruction_count = visual.instructions.len().max(1);
+    let (active, local) = if progress >= 1.0 {
+        (instruction_count - 1, 1.0)
+    } else {
+        let scaled = progress * instruction_count as f32;
+        (
+            (scaled.floor() as usize).min(instruction_count - 1),
+            scaled.fract(),
+        )
+    };
+    let active_stage = visual.instructions[active].stage;
+    let (packet_x, packet_y) = logic_route_packet(active, local, visual.score_nodes.len());
+
+    panel = panel.child(render_logic_flow(
+        &visual.stages,
+        &visual.score_nodes,
+        active_stage,
+        active,
+        packet_x,
+        packet_y,
+    ));
+
+    for (index, instruction) in visual.instructions.into_iter().enumerate() {
+        panel = panel.child(render_logic_instruction_row(
+            index,
+            instruction,
+            index == active,
+        ));
+    }
+
+    panel
+}
+
+fn render_logic_flow(
+    stages: &[LogicStage],
+    score_nodes: &[LogicScoreNode],
+    active_stage: usize,
+    active_instruction: usize,
+    packet_x: f32,
+    packet_y: f32,
+) -> impl IntoElement {
+    let path = logic_path(score_nodes.len());
+
+    div()
+        .absolute()
+        .left(px(LOGIC_FLOW_X))
+        .top(px(LOGIC_FLOW_Y))
+        .w(px(LOGIC_FLOW_W))
+        .h(px(LOGIC_FLOW_H))
+        .bg(rgb(0x0b1020))
+        .border_b_1()
+        .border_color(rgb(0x26364d))
+        .children(path.segments.into_iter().map(logic_path_segment))
+        .child(
+            div()
+                .absolute()
+                .left(px(packet_x))
+                .top(px(packet_y))
+                .w(px(16.0))
+                .h(px(16.0))
+                .rounded_lg()
+                .bg(rgb(stages[active_stage].color))
+                .border_1()
+                .border_color(rgb(0xffe4a3))
+                .opacity(0.9),
+        )
+        .child(logic_node(12.0, 12.0, stages[0].clone(), active_stage == 0))
+        .child(logic_node(92.0, 12.0, stages[1].clone(), active_stage == 1))
+        .child(logic_node(
+            172.0,
+            12.0,
+            stages[2].clone(),
+            active_stage == 2,
+        ))
+        .children(score_nodes.iter().enumerate().map(|(index, node)| {
+            logic_candidate_node(
+                28.0,
+                66.0 + index as f32 * 28.0,
+                node.clone(),
+                active_instruction == 3 + index,
+            )
+        }))
+        .child(logic_node(
+            174.0,
+            88.0,
+            stages[4].clone(),
+            active_stage == 4,
+        ))
+        .child(logic_node(
+            254.0,
+            88.0,
+            stages[5].clone(),
+            active_stage == 5,
+        ))
+}
+
+fn logic_path(score_count: usize) -> LogicPath {
+    let branch_count = score_count.clamp(1, 3);
+    let branch_ys = (0..branch_count)
+        .map(|index| 77.0 + index as f32 * 28.0)
+        .collect::<Vec<_>>();
+    let first_branch_y = *branch_ys.first().unwrap_or(&77.0);
+    let last_branch_y = *branch_ys.last().unwrap_or(&77.0);
+    let pick_y = 105.0;
+    let merge_top = first_branch_y.min(pick_y);
+    let merge_bottom = last_branch_y.max(pick_y);
+
+    let mut segments = vec![
+        LogicPathSegment {
+            left: 70.0,
+            top: 29.0,
+            width: 22.0,
+            height: 2.0,
+        },
+        LogicPathSegment {
+            left: 150.0,
+            top: 29.0,
+            width: 22.0,
+            height: 2.0,
+        },
+        LogicPathSegment {
+            left: 201.0,
+            top: 46.0,
+            width: 2.0,
+            height: (last_branch_y - 46.0).max(0.0),
+        },
+        LogicPathSegment {
+            left: 154.0,
+            top: merge_top,
+            width: 2.0,
+            height: (merge_bottom - merge_top).max(2.0),
+        },
+        LogicPathSegment {
+            left: 154.0,
+            top: pick_y,
+            width: 20.0,
+            height: 2.0,
+        },
+        LogicPathSegment {
+            left: 232.0,
+            top: pick_y,
+            width: 22.0,
+            height: 2.0,
+        },
+    ];
+
+    for y in branch_ys {
+        segments.push(LogicPathSegment {
+            left: 136.0,
+            top: y,
+            width: 65.0,
+            height: 2.0,
+        });
+    }
+
+    LogicPath { segments }
+}
+
+fn logic_path_segment(segment: LogicPathSegment) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(segment.left))
+        .top(px(segment.top))
+        .w(px(segment.width))
+        .h(px(segment.height))
+        .rounded_full()
+        .bg(rgb(0x26364d))
+}
+
+fn logic_node(left: f32, top: f32, stage: LogicStage, active: bool) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(58.0))
+        .h(px(34.0))
+        .rounded_lg()
+        .overflow_hidden()
+        .bg(if active { rgb(0x2f2816) } else { rgb(0x101827) })
+        .border_1()
+        .border_color(if active {
+            rgb(stage.color)
+        } else {
+            rgb(0x314058)
+        })
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(stage.color))
+                .child(stage.label),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(if active { rgb(0xffe4a3) } else { rgb(0x9ba8bf) })
+                .child(stage.value),
+        )
+}
+
+fn logic_candidate_node(
+    left: f32,
+    top: f32,
+    node: LogicScoreNode,
+    active: bool,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(108.0))
+        .h(px(22.0))
+        .rounded_lg()
+        .overflow_hidden()
+        .bg(if active { rgb(0x3b2f18) } else { rgb(0x101827) })
+        .border_1()
+        .border_color(if active { rgb(0xffd166) } else { rgb(0x314058) })
+        .flex()
+        .items_center()
+        .justify_between()
+        .px_2()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(0xffd166))
+                .child(node.label),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(if active { rgb(0xffe4a3) } else { rgb(0x9ba8bf) })
+                .child(node.value),
+        )
+}
+
+fn render_logic_instruction_row(
+    index: usize,
+    instruction: LogicInstruction,
+    active: bool,
+) -> impl IntoElement {
+    let top = LOGIC_ROW_START + index as f32 * (LOGIC_ROW_H + LOGIC_ROW_GAP);
+
+    div()
+        .absolute()
+        .left(px(10.0))
+        .top(px(top))
+        .w(px(308.0))
+        .h(px(LOGIC_ROW_H))
+        .rounded_lg()
+        .overflow_hidden()
+        .bg(if active { rgb(0x1e293b) } else { rgb(0x101827) })
+        .border_1()
+        .border_color(if active {
+            rgb(instruction.color)
+        } else {
+            rgb(0x26364d)
+        })
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .child(
+            div()
+                .w(px(10.0))
+                .text_color(if active {
+                    rgb(instruction.color)
+                } else {
+                    rgb(0x536179)
+                })
+                .child(if active { "▶" } else { "·" }),
+        )
+        .child(
+            div()
+                .w(px(66.0))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(instruction.color))
+                .child(instruction.op),
+        )
+        .child(
+            div()
+                .w(px(72.0))
+                .text_sm()
+                .text_color(if active { rgb(0xffe4a3) } else { rgb(0xeef3ff) })
+                .child(instruction.arg),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(if active { rgb(0xffd166) } else { rgb(0x9ba8bf) })
+                .child(instruction.note),
+        )
+}
+
+fn logic_route_packet(active_instruction: usize, local: f32, score_count: usize) -> (f32, f32) {
+    let score_count = score_count.max(1);
+    let pick_index = 3 + score_count;
+    match active_instruction {
+        0 => lerp_point((22.0, 21.0), (58.0, 21.0), local),
+        1 => lerp_point((62.0, 21.0), (138.0, 21.0), local),
+        2 => lerp_point((138.0, 21.0), (205.0, 58.0), local),
+        index if index < pick_index => {
+            let branch = index.saturating_sub(3).min(2);
+            logic_branch_route(local, 69.0 + branch as f32 * 28.0)
+        }
+        index if index == pick_index => lerp_point((136.0, 105.0), (195.0, 97.0), local),
+        _ => lerp_point((195.0, 97.0), (275.0, 97.0), local),
+    }
+}
+
+fn logic_branch_route(local: f32, y: f32) -> (f32, f32) {
+    let points = [
+        (205.0, 58.0),
+        (136.0, y),
+        (42.0, y),
+        (136.0, y),
+        (195.0, 97.0),
+    ];
+    let scaled = (local * 4.0).min(3.999);
+    let index = scaled.floor() as usize;
+    let t = scaled - index as f32;
+    lerp_point(points[index], points[index + 1], t)
+}
+
+fn lerp_point(start: (f32, f32), end: (f32, f32), t: f32) -> (f32, f32) {
+    (
+        start.0 + (end.0 - start.0) * t,
+        start.1 + (end.1 - start.1) * t,
+    )
 }
 
 fn random_player() -> Player {
@@ -1232,11 +1958,11 @@ fn paint_ellipse(
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, gpui::size(px(980.0), px(700.0)), cx);
+        let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(700.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(gpui::size(px(680.0), px(500.0))),
+                window_min_size: Some(gpui::size(px(900.0), px(520.0))),
                 focus: true,
                 ..Default::default()
             },
